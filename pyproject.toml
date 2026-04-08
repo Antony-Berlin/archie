@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-neural-arch-bench"
+version = "0.1.0"
+description = "NeuralArch-Bench: Automated Neural Architecture Search environment for OpenEnv"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core>=0.2.2",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+server = "neural_arch_bench.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["neural_arch_bench", "neural_arch_bench.core", "neural_arch_bench.server"]
+package-dir = { "neural_arch_bench" = ".", "neural_arch_bench.core" = "core", "neural_arch_bench.server" = "server" }

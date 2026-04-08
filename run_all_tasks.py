@@ -1,24 +1,13 @@
 """
-Inference script for NeuralArch-Bench (hackathon evaluator).
+Run inference for ALL tasks in NeuralArch-Bench with their respective graders.
 
-Runs a 3-phase cycle: DIAGNOSE → PLAN → IMPLEMENT, repeated MAX_CYCLES times.
-Each phase calls the LLM with a phase-specific prompt and submits one env.step().
+Tasks:
+    arch-foundations  (Easy)   — accuracy > 85% within 2 implement steps
+    efficient-net     (Medium) — accuracy > 80% with param_count < 10,000
+    residual-depth    (Hard)   — accuracy > 75% on breast_cancer dataset
 
-When RUN_ALL_TASKS=1 (or MY_ENV_V4_TASK is not set), all three tasks are run
-sequentially with their respective grader configurations and a summary is printed.
-
-Required environment variables:
-    API_BASE_URL       LLM endpoint   (default: https://router.huggingface.co/v1)
-    MODEL_NAME         Model ID       (default: Qwen/Qwen2.5-72B-Instruct)
-    HF_TOKEN / API_KEY Auth key
-    MY_ENV_V4_TASK     Task name      (default: run all tasks)
-    MY_ENV_V4_BENCHMARK Benchmark    (default: neural-arch-bench)
-    RUN_ALL_TASKS      Set to 1 to force running all tasks
-
-Stdout format (mandatory):
-    [START] task=<name> env=<bench> model=<model>
-    [STEP]  step=<n> action=<str> reward=<0.00> done=<bool> error=<msg|null>
-    [END]   success=<bool> steps=<n> score=<0.000> rewards=<r1,r2,...>
+Usage:
+    python run_all_tasks.py
 """
 
 import asyncio
@@ -38,56 +27,25 @@ if _env_file.exists():
 
 from openai import OpenAI
 
-from core.models import NeuralArchAction as _Action  # type: ignore[assignment]
-from core.task_graders import TASK_IDS, get_grader, EpisodeResult  # type: ignore[assignment]
-from server.neural_arch_environment import NeuralArchEnvironment as _Env  # type: ignore[assignment]
+from core.models import NeuralArchAction as _Action
+from core.task_graders import TASK_IDS, get_grader, EpisodeResult
+from server.neural_arch_environment import NeuralArchEnvironment as _Env
 
-# IMAGE_NAME is set by the validator to the running Space/container base URL
-IMAGE_NAME = os.getenv("IMAGE_NAME")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-TASK_NAME = os.getenv("MY_ENV_V4_TASK", "")   # empty = run all tasks
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "neural-arch-bench")
-RUN_ALL = os.getenv("RUN_ALL_TASKS", "1") == "1" or not TASK_NAME
 
-MAX_CYCLES = 4           # 4 full DPI cycles = 12 total env.step() calls
+MAX_CYCLES = 4
 MAX_STEPS = MAX_CYCLES * 3
 SUCCESS_SCORE_THRESHOLD = 0.5
-
-# Max reward: per cycle = 0.7 (diagnose) + 0.7 (plan) + 10.1 (implement)
 _MAX_REWARD = MAX_CYCLES * (0.7 + 0.7 + 10.1)
 
-# ── dataset hint lookup ────────────────────────────────────────────────────────
 _DATASET_INFO = {
     "iris":          {"num_features": 4,  "num_classes": 3},
     "wine":          {"num_features": 13, "num_classes": 3},
     "breast_cancer": {"num_features": 30, "num_classes": 2},
 }
-
-# ── task-specific hints injected into plan/implement prompts ──────────────────
-_TASK_PLAN_HINT = {
-    "arch-foundations": "Focus on fast accuracy improvement. You have at most 2 implement steps.",
-    "efficient-net":    "Keep param_count UNDER 10,000. Use small hidden dims (32–64 max).",
-    "residual-depth":   "The dataset has 30 features. Use sufficient capacity with residual connections or deep MLP.",
-}
-_TASK_IMPLEMENT_HINT = {
-    "arch-foundations": (
-        "TASK GOAL: Reach accuracy > 85% as fast as possible (within 2 implement steps). "
-        "Prioritize a well-regularized, reliable architecture over novelty."
-    ),
-    "efficient-net": (
-        "TASK GOAL: Achieve accuracy > 80% while keeping param_count UNDER 10,000. "
-        "Use small hidden dims (e.g., 32–64 neurons max). Compact BatchNorm + Dropout MLP preferred."
-    ),
-    "residual-depth": (
-        "TASK GOAL: Achieve accuracy > 75% on breast_cancer (NUM_FEATURES=30, NUM_CLASSES=2). "
-        "Use sufficient capacity for 30 input features. Residual/skip connections are allowed. "
-        "BatchNorm and Dropout help with generalization on this dataset."
-    ),
-}
-
-# ── system prompts ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT_DIAGNOSE = textwrap.dedent("""
     You are a deep learning researcher diagnosing a PyTorch model for tabular classification.
@@ -145,10 +103,35 @@ SYSTEM_PROMPT_IMPLEMENT = textwrap.dedent("""
 """).strip()
 
 
+def _build_task_system_prompt_implement(task_id: str) -> str:
+    """Augment the implement prompt with task-specific guidance."""
+    grader = get_grader(task_id)
+    task_hint = {
+        "arch-foundations": (
+            "TASK GOAL: Reach accuracy > 85% as fast as possible (within 2 implement steps). "
+            "Prioritize a well-regularized, reliable architecture over novelty."
+        ),
+        "efficient-net": (
+            "TASK GOAL: Achieve accuracy > 80% while keeping param_count UNDER 10,000. "
+            "Use small hidden dims (e.g., 32–64 neurons max). "
+            "Avoid unnecessary layers. Compact BatchNorm + Dropout MLP preferred."
+        ),
+        "residual-depth": (
+            "TASK GOAL: Achieve accuracy > 75% on breast_cancer (NUM_FEATURES=30, NUM_CLASSES=2). "
+            "Use sufficient capacity for 30 input features. Residual/skip connections are allowed. "
+            "BatchNorm and Dropout help with generalization on this dataset."
+        ),
+    }.get(task_id, "")
+
+    return SYSTEM_PROMPT_IMPLEMENT + (f"\n\n{task_hint}" if task_hint else "")
+
+
 # ── stdout helpers ─────────────────────────────────────────────────────────────
 
 def log_start(task: str, env: str, model: str) -> None:
+    print(f"\n{'='*70}", flush=True)
     print(f"[START] task={task} env={env} model={model}", flush=True)
+    print(f"{'='*70}", flush=True)
 
 
 def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
@@ -169,15 +152,15 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 
-def log_grader(task_id: str, ep: EpisodeResult, grader_score: float) -> None:
-    g = get_grader(task_id)
-    print(
-        f"[GRADER] task={task_id} difficulty={g.difficulty} "
-        f"accuracy={ep.accuracy:.4f} param_count={ep.param_count} "
-        f"implement_steps={ep.implement_steps} dataset={ep.dataset_name} "
-        f"score={grader_score:.4f} criteria='{g.success_criteria}'",
-        flush=True,
-    )
+def log_grader_result(task_id: str, episode_result: EpisodeResult, grader_score: float) -> None:
+    grader = get_grader(task_id)
+    print(f"\n[GRADER] task={task_id} difficulty={grader.difficulty}", flush=True)
+    print(f"[GRADER] accuracy={episode_result.accuracy:.4f} "
+          f"param_count={episode_result.param_count} "
+          f"implement_steps={episode_result.implement_steps} "
+          f"dataset={episode_result.dataset_name}", flush=True)
+    print(f"[GRADER] score={grader_score:.4f} "
+          f"success_criteria='{grader.success_criteria}'", flush=True)
 
 
 # ── LLM helpers ────────────────────────────────────────────────────────────────
@@ -224,11 +207,16 @@ def get_diagnosis(client: OpenAI, obs) -> str:
 
 
 def get_plan(client: OpenAI, obs, task_id: str) -> str:
-    hint = _TASK_PLAN_HINT.get(task_id, "")
     grader = get_grader(task_id)
+    task_hint = {
+        "arch-foundations": "Focus on fast accuracy improvement. You have at most 2 implement steps.",
+        "efficient-net": "Keep param_count UNDER 10,000. Use small hidden dims (32–64 max).",
+        "residual-depth": "The dataset has 30 features. Ensure sufficient model capacity with residual connections or deep MLP.",
+    }.get(task_id, "")
+
     user = textwrap.dedent(f"""
         Task         : {task_id} ({grader.difficulty}) — {grader.success_criteria}
-        {f'Task hint    : {hint}' if hint else ''}
+        {f'Task hint    : {task_hint}' if task_hint else ''}
         Dataset      : {getattr(obs, 'dataset_name', 'iris')} ({_dataset_hint(obs)})
         Last accuracy: {obs.last_accuracy:.4f}
         Param count  : {obs.param_count}
@@ -244,8 +232,7 @@ def get_plan(client: OpenAI, obs, task_id: str) -> str:
 
 
 def get_model_code(client: OpenAI, obs, task_id: str) -> str:
-    task_hint = _TASK_IMPLEMENT_HINT.get(task_id, "")
-    system = SYSTEM_PROMPT_IMPLEMENT + (f"\n\n{task_hint}" if task_hint else "")
+    system = _build_task_system_prompt_implement(task_id)
     user = textwrap.dedent(f"""
         Dataset      : {getattr(obs, 'dataset_name', 'iris')} ({_dataset_hint(obs)})
         Last accuracy: {obs.last_accuracy:.4f}
@@ -288,10 +275,18 @@ def _fallback_code() -> str:
     """).strip()
 
 
-# ── single-task episode runner ─────────────────────────────────────────────────
+def _unpack(result):
+    obs = getattr(result, "observation", result)
+    reward = float(getattr(result, "reward", 0) or getattr(obs, "reward", 0) or 0)
+    done = bool(getattr(result, "done", False) or getattr(obs, "done", False))
+    return obs, reward, done
+
+
+# ── single task runner ─────────────────────────────────────────────────────────
 
 async def run_task(task_id: str, client: OpenAI) -> dict:
     """Run a full episode for one task. Returns summary dict."""
+    # Each task gets a fresh environment instance with the correct task_id set
     os.environ["MY_ENV_V4_TASK"] = task_id
     env = _Env()
 
@@ -355,16 +350,21 @@ async def run_task(task_id: str, client: OpenAI) -> dict:
         success = score >= SUCCESS_SCORE_THRESHOLD
 
         # ── Grader evaluation ──────────────────────────────────────────
-        ep = EpisodeResult(
-            accuracy=getattr(final_obs, "last_accuracy", 0.0),
-            param_count=getattr(final_obs, "param_count", 0),
-            implement_steps=implement_steps,
-            dataset_name=getattr(final_obs, "dataset_name", "iris"),
-            rewards=rewards,
-            error_logs=getattr(final_obs, "error_logs", None),
-        )
-        grader_score = get_grader(task_id).grade(ep)
-        log_grader(task_id, ep, grader_score)
+        if final_obs is not None:
+            episode_result = EpisodeResult(
+                accuracy=getattr(final_obs, "last_accuracy", 0.0),
+                param_count=getattr(final_obs, "param_count", 0),
+                implement_steps=implement_steps,
+                dataset_name=getattr(final_obs, "dataset_name", "iris"),
+                rewards=rewards,
+                error_logs=getattr(final_obs, "error_logs", None),
+            )
+            grader = get_grader(task_id)
+            grader_score = grader.grade(episode_result)
+            log_grader_result(task_id, episode_result, grader_score)
+        else:
+            grader_score = 0.0
+            episode_result = None
 
     finally:
         try:
@@ -379,56 +379,49 @@ async def run_task(task_id: str, client: OpenAI) -> dict:
     return {
         "task_id": task_id,
         "score": score,
-        "grader_score": grader_score,
+        "grader_score": grader_score if final_obs is not None else 0.0,
         "success": success,
         "steps": steps_taken,
         "rewards": rewards,
     }
 
 
-def _unpack(result):
-    obs = getattr(result, "observation", result)
-    reward = float(getattr(result, "reward", 0) or getattr(obs, "reward", 0) or 0)
-    done = bool(getattr(result, "done", False) or getattr(obs, "done", False))
-    return obs, reward, done
-
-
-# ── main ───────────────────────────────────────────────────────────────────────
+# ── main: run all tasks ────────────────────────────────────────────────────────
 
 async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-    tasks_to_run = TASK_IDS if RUN_ALL else [TASK_NAME]
-
-    if RUN_ALL:
-        print(f"\n{'#'*70}", flush=True)
-        print(f"# NeuralArch-Bench — Running ALL tasks: {tasks_to_run}", flush=True)
-        print(f"# Model: {MODEL_NAME}", flush=True)
-        print(f"{'#'*70}\n", flush=True)
+    print(f"\n{'#'*70}", flush=True)
+    print(f"# NeuralArch-Bench — Running ALL tasks", flush=True)
+    print(f"# Tasks: {TASK_IDS}", flush=True)
+    print(f"# Model: {MODEL_NAME}", flush=True)
+    print(f"{'#'*70}\n", flush=True)
 
     all_results = []
-    for task_id in tasks_to_run:
+    for task_id in TASK_IDS:
         result = await run_task(task_id, client)
         all_results.append(result)
 
-    if RUN_ALL:
-        _difficulties = {"arch-foundations": "easy", "efficient-net": "medium", "residual-depth": "hard"}
-        print(f"\n{'#'*70}", flush=True)
-        print(f"# SUMMARY", flush=True)
-        print(f"{'#'*70}", flush=True)
-        print(f"{'Task':<20} {'Difficulty':<12} {'Score':>8} {'GraderScore':>12} {'Success':>8} {'Steps':>6}", flush=True)
-        print(f"{'-'*70}", flush=True)
-        for r in all_results:
-            diff = _difficulties.get(r["task_id"], "?")
-            print(
-                f"{r['task_id']:<20} {diff:<12} {r['score']:>8.3f} {r['grader_score']:>12.4f} "
-                f"{'yes' if r['success'] else 'no':>8} {r['steps']:>6}",
-                flush=True,
-            )
-        overall = sum(r["grader_score"] for r in all_results) / len(all_results)
-        print(f"{'-'*70}", flush=True)
-        print(f"{'OVERALL AVERAGE':<20} {'':12} {'':>8} {overall:>12.4f}", flush=True)
-        print(f"{'#'*70}\n", flush=True)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print(f"\n{'#'*70}", flush=True)
+    print(f"# SUMMARY", flush=True)
+    print(f"{'#'*70}", flush=True)
+    print(f"{'Task':<20} {'Difficulty':<12} {'Score':>8} {'GraderScore':>12} {'Success':>8} {'Steps':>6}", flush=True)
+    print(f"{'-'*70}", flush=True)
+
+    difficulties = {"arch-foundations": "easy", "efficient-net": "medium", "residual-depth": "hard"}
+    for r in all_results:
+        diff = difficulties.get(r["task_id"], "?")
+        print(
+            f"{r['task_id']:<20} {diff:<12} {r['score']:>8.3f} {r['grader_score']:>12.4f} "
+            f"{'yes' if r['success'] else 'no':>8} {r['steps']:>6}",
+            flush=True,
+        )
+
+    overall = sum(r["grader_score"] for r in all_results) / len(all_results)
+    print(f"{'-'*70}", flush=True)
+    print(f"{'OVERALL AVERAGE':<20} {'':12} {'':>8} {overall:>12.4f}", flush=True)
+    print(f"{'#'*70}\n", flush=True)
 
 
 if __name__ == "__main__":

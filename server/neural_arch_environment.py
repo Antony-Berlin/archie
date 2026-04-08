@@ -13,6 +13,7 @@ Reward formulas:
 """
 
 import json
+import os
 import random
 import re
 import shutil
@@ -30,10 +31,12 @@ try:
     from ..core.models import NeuralArchAction, NeuralArchObservation
     from ..core.arch_library import ARCH_LIBRARY
     from ..core.dataset_library import DATASET_LIBRARY
+    from ..core.task_graders import EpisodeResult, get_grader, TASK_IDS
 except ImportError:
     from core.models import NeuralArchAction, NeuralArchObservation
     from core.arch_library import ARCH_LIBRARY
     from core.dataset_library import DATASET_LIBRARY
+    from core.task_graders import EpisodeResult, get_grader, TASK_IDS
 
 _REPO_ROOT = Path(__file__).parent.parent
 _TRAINER = _REPO_ROOT / "core" / "trainer.py"
@@ -57,6 +60,14 @@ class NeuralArchEnvironment(Environment):
         self._last_diagnosis: Optional[str] = None
         self._last_plan: Optional[str] = None
         self._phase_rewards: list[float] = []
+        # Task grading
+        _task_id = os.getenv("MY_ENV_V4_TASK", "arch-foundations")
+        if _task_id not in TASK_IDS:
+            _task_id = "arch-foundations"
+        self._task_id: str = _task_id
+        self._grader = get_grader(self._task_id)
+        self._implement_steps: int = 0
+        self._task_score: float = 0.0
 
     # ------------------------------------------------------------------
     # OpenEnv interface
@@ -81,6 +92,9 @@ class NeuralArchEnvironment(Environment):
         self._last_diagnosis = None
         self._last_plan = None
         self._phase_rewards = []
+        # Reset task grading state
+        self._implement_steps = 0
+        self._task_score = 0.0
 
         return self._build_obs(reward=0.0)
 
@@ -157,6 +171,19 @@ class NeuralArchEnvironment(Environment):
         reward = self._compute_reward(accuracy, param_count, runtime_error)
         self._last_accuracy = accuracy
         self._phase_rewards.append(reward)
+        self._implement_steps += 1
+
+        # Grade against the active task
+        ep_result = EpisodeResult(
+            accuracy=accuracy,
+            param_count=param_count,
+            implement_steps=self._implement_steps,
+            dataset_name=self._current_dataset_name,
+            rewards=list(self._phase_rewards),
+            error_logs=error_logs,
+        )
+        self._task_score = self._grader.grade(ep_result)
+        task_done = self._grader.is_success(ep_result)
 
         cycle_rewards = list(self._phase_rewards)
         self._reset_cycle()
@@ -168,6 +195,7 @@ class NeuralArchEnvironment(Environment):
             param_count=param_count,
             loss_curve=loss_curve,
             phase_rewards_override=cycle_rewards,
+            done=task_done,
         )
 
     # ------------------------------------------------------------------
@@ -259,6 +287,7 @@ class NeuralArchEnvironment(Environment):
         param_count: int = 0,
         loss_curve: Optional[list] = None,
         phase_rewards_override: Optional[list] = None,
+        done: bool = False,
     ) -> NeuralArchObservation:
         return NeuralArchObservation(
             current_code=self._current_code,
@@ -268,12 +297,14 @@ class NeuralArchEnvironment(Environment):
             param_count=param_count,
             loss_curve=loss_curve or [],
             error_logs=error_logs,
-            done=False,
+            done=done,
             reward=reward,
             current_phase=self._current_phase,
             last_diagnosis=self._last_diagnosis,
             last_plan=self._last_plan,
             phase_rewards=phase_rewards_override if phase_rewards_override is not None else list(self._phase_rewards),
+            task_id=self._task_id,
+            task_score=self._task_score,
         )
 
     def _reset_cycle(self) -> None:

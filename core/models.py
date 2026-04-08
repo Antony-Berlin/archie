@@ -68,3 +68,13 @@ class NeuralArchObservation(Observation):
         default_factory=list,
         description="Rewards earned so far in the current cycle [diag_reward, plan_reward, impl_reward]",
     )
+
+    # ── task grading ──────────────────────────────────────────────────
+    task_id: str = Field(
+        default="arch-foundations",
+        description="Active task ID: 'arch-foundations' | 'efficient-net' | 'residual-depth'",
+    )
+    task_score: float = Field(
+        default=0.0,
+        description="Normalized task score in [0.0, 1.0] from the task grader after each implement step",
+    )

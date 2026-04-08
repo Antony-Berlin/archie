@@ -20,7 +20,17 @@ Stdout format (mandatory):
 import asyncio
 import os
 import textwrap
+from pathlib import Path
 from typing import List, Optional
+
+# Load .env file from repo root if present
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 from openai import OpenAI
 
@@ -39,7 +49,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "arch-foundations")
 BENCHMARK = os.getenv("MY_ENV_V4_BENCHMARK", "neural-arch-bench")
 
-MAX_CYCLES = 2           # 2 full DPI cycles = 6 total env.step() calls
+MAX_CYCLES = 4           # 4 full DPI cycles = 12 total env.step() calls
 MAX_STEPS = MAX_CYCLES * 3
 SUCCESS_SCORE_THRESHOLD = 0.5
 

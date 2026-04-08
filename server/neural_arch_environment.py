@@ -1,70 +1,62 @@
 """
 NeuralArch-Bench Environment Implementation.
 
-The agent (LLM) acts as a deep learning researcher:
-  1. reset()  — randomly picks an architecture and dataset from the libraries,
-                loads that architecture, returns starting observation
-  2. step()   — accepts either a full model replacement (new_model_code) or an
-                incremental layer modification (layer_modification), runs
-                trainer.py in a subprocess (timeout=40 s), computes reward,
-                returns observation
+The agent runs a 3-phase cycle per turn:
+  1. DIAGNOSE  — explains what is wrong with the current model (heuristic reward)
+  2. PLAN      — describes the architectural change to make (heuristic reward)
+  3. IMPLEMENT — writes new model code; training runs (accuracy-based reward)
 
-Reward formula (per project.md):
-  +0.1   code compiles and trainer runs without RuntimeError
-  +10.0 × (new_acc − old_acc)   performance improvement
-  −0.01 × (param_count / 1000)  efficiency penalty
-  −1.0   trainer subprocess exited with RuntimeError / timeout
+Reward formulas:
+  DIAGNOSE:  0–0.7 heuristic score based on diagnosis quality
+  PLAN:      0–0.7 heuristic score based on plan specificity and coherence
+  IMPLEMENT: +0.1 execution  +10.0×Δacc  −0.01×(params/1000)  −1.0 on error
 """
 
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import State
 
-# Support both package-import and direct-run contexts
 try:
     from ..core.models import NeuralArchAction, NeuralArchObservation
     from ..core.arch_library import ARCH_LIBRARY
     from ..core.dataset_library import DATASET_LIBRARY
-    from ..core.layer_modifier import apply_layer_modification
 except ImportError:
     from core.models import NeuralArchAction, NeuralArchObservation
     from core.arch_library import ARCH_LIBRARY
     from core.dataset_library import DATASET_LIBRARY
-    from core.layer_modifier import apply_layer_modification
 
-# Resolve paths relative to the *repo root* (one level up from server/)
 _REPO_ROOT = Path(__file__).parent.parent
 _TRAINER = _REPO_ROOT / "core" / "trainer.py"
 
 
 class NeuralArchEnvironment(Environment):
-    """
-    Neural Architecture Search environment for the NeuralArch-Bench hackathon.
-
-    Each episode randomly picks an architecture from the library and a dataset
-    to train on. The agent improves the architecture step-by-step; each step
-    triggers a real training run and produces a reward based on accuracy delta
-    and parameter efficiency.
-    """
+    """Neural Architecture Search environment with 3-phase step protocol."""
 
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
 
     def __init__(self):
         super().__init__()
-        self._workdir: Path | None = None
+        self._workdir: Optional[Path] = None
         self._state = State(episode_id=str(uuid4()), step_count=0)
         self._last_accuracy: float = 0.0
         self._current_code: str = ""
         self._current_arch_name: str = "unknown"
-        self._current_dataset_name: str = "fashion_mnist"
+        self._current_dataset_name: str = "iris"
+        # Phase state
+        self._current_phase: str = "diagnose"
+        self._last_diagnosis: Optional[str] = None
+        self._last_plan: Optional[str] = None
+        self._phase_rewards: list[float] = []
 
     # ------------------------------------------------------------------
     # OpenEnv interface
@@ -78,76 +70,166 @@ class NeuralArchEnvironment(Environment):
         self._state = State(episode_id=episode_id or str(uuid4()), step_count=0)
         self._last_accuracy = 0.0
 
-        # Reproducible random selection when seed is provided
         rng = random.Random(seed)
         self._current_arch_name = rng.choice(list(ARCH_LIBRARY.keys()))
         self._current_dataset_name = rng.choice(list(DATASET_LIBRARY.keys()))
-
         self._current_code = ARCH_LIBRARY[self._current_arch_name]
-        model_dest = self._workdir / "model_to_edit.py"
-        model_dest.write_text(self._current_code)
+        (self._workdir / "model_to_edit.py").write_text(self._current_code)
 
-        return NeuralArchObservation(
-            current_code=self._current_code,
-            architecture_name=self._current_arch_name,
-            dataset_name=self._current_dataset_name,
-            last_accuracy=0.0,
-            param_count=0,
-            loss_curve=[],
-            error_logs=None,
-            done=False,
-            reward=0.0,
-        )
+        # Reset phase state
+        self._current_phase = "diagnose"
+        self._last_diagnosis = None
+        self._last_plan = None
+        self._phase_rewards = []
+
+        return self._build_obs(reward=0.0)
 
     def step(self, action: NeuralArchAction, timeout_s=None, **kwargs) -> NeuralArchObservation:
-        """Apply action, run trainer subprocess, return observation + reward."""
+        """Dispatch to the appropriate phase handler."""
         if self._workdir is None:
-            raise RuntimeError("Environment not reset. Call reset() before step().")
-
+            raise RuntimeError("Call reset() before step().")
         self._state.step_count += 1
+
+        if self._current_phase == "diagnose":
+            return self._step_diagnose(action)
+        elif self._current_phase == "plan":
+            return self._step_plan(action)
+        else:
+            return self._step_implement(action)
+
+    @property
+    def state(self) -> State:
+        return self._state
+
+    def close(self) -> None:
+        self._cleanup()
+
+    # ------------------------------------------------------------------
+    # Phase handlers
+    # ------------------------------------------------------------------
+
+    def _step_diagnose(self, action: NeuralArchAction) -> NeuralArchObservation:
+        diagnosis = action.diagnosis or ""
+        reward = self._score_diagnosis(diagnosis, self._current_code)
+        self._last_diagnosis = diagnosis
+        self._phase_rewards = [reward]
+        self._current_phase = "plan"
+        return self._build_obs(reward=reward)
+
+    def _step_plan(self, action: NeuralArchAction) -> NeuralArchObservation:
+        plan = action.change_plan or ""
+        reward = self._score_plan(plan, self._last_diagnosis or "")
+        self._last_plan = plan
+        self._phase_rewards.append(reward)
+        self._current_phase = "implement"
+        return self._build_obs(reward=reward)
+
+    def _step_implement(self, action: NeuralArchAction) -> NeuralArchObservation:
+        new_code = action.new_model_code or ""
+        if not new_code:
+            reward = -1.0
+            self._phase_rewards.append(reward)
+            self._reset_cycle()
+            return self._build_obs(reward=reward, error_logs="No model code provided in implement phase.")
+
         model_file = self._workdir / "model_to_edit.py"
         results_file = self._workdir / "results.json"
-
-        # Determine new architecture code and update arch name
-        modifier_error: str | None = None
-
-        if action.new_model_code:
-            new_code = action.new_model_code
-            self._current_arch_name = "custom"
-        elif action.layer_modification:
-            new_code, success = apply_layer_modification(
-                self._current_code, action.layer_modification
-            )
-            if not success:
-                modifier_error = (
-                    f"[layer_modifier] Could not parse instruction: "
-                    f"{action.layer_modification!r}. Proceeding with unchanged code."
-                )
-        else:
-            # Validator prevents this, but be defensive
-            new_code = self._current_code
+        if results_file.exists():
+            results_file.unlink()
 
         model_file.write_text(new_code)
         self._current_code = new_code
+        self._current_arch_name = "custom"
 
-        # Run trainer in isolation, passing the chosen dataset
         proc = subprocess.run(
-            [
-                sys.executable, str(_TRAINER),
-                "--model-file", str(model_file),
-                "--results-file", str(results_file),
-                "--dataset", self._current_dataset_name,
-            ],
-            timeout=40,
+            [sys.executable, str(_TRAINER),
+             "--model-file", str(model_file),
+             "--results-file", str(results_file),
+             "--dataset", self._current_dataset_name],
+            timeout=60,
             capture_output=True,
             text=True,
         )
 
-        # Parse results
-        accuracy = 0.0
-        param_count = 0
-        loss_curve: list[float] = []
-        error_logs: str | None = modifier_error
+        accuracy, param_count, loss_curve, error_logs, runtime_error = self._parse_results(
+            results_file, proc
+        )
+        reward = self._compute_reward(accuracy, param_count, runtime_error)
+        self._last_accuracy = accuracy
+        self._phase_rewards.append(reward)
+
+        cycle_rewards = list(self._phase_rewards)
+        self._reset_cycle()
+
+        return self._build_obs(
+            reward=reward,
+            error_logs=error_logs,
+            accuracy=accuracy,
+            param_count=param_count,
+            loss_curve=loss_curve,
+            phase_rewards_override=cycle_rewards,
+        )
+
+    # ------------------------------------------------------------------
+    # Reward scorers
+    # ------------------------------------------------------------------
+
+    def _score_diagnosis(self, diagnosis: str, code: str) -> float:
+        if len(diagnosis) < 10:
+            return 0.0
+        score = 0.0
+        low = diagnosis.lower()
+        if "accuracy" in low or "performance" in low:
+            score += 0.3
+        if any(w in low for w in ("overfitting", "underfitting", "generalization", "generalisation")):
+            score += 0.2
+        layer_names = re.findall(r'self\.(\w+)', code)
+        if any(name in diagnosis for name in layer_names):
+            score += 0.1
+        if len(diagnosis) > 100:
+            score += 0.1
+        return round(score, 4)
+
+    def _score_plan(self, plan: str, diagnosis: str) -> float:
+        if not plan:
+            return 0.0
+        score = 0.0
+        low = plan.lower()
+        layer_keywords = ("batchnorm", "dropout", "linear", "relu", "sigmoid",
+                          "tanh", "layernorm", "gelu", "conv", "embedding")
+        if any(kw in low for kw in layer_keywords):
+            score += 0.3
+        reasoning_words = ("improve", "expect", "because", "reduce", "increase",
+                           "prevent", "help", "avoid", "allow", "should", "will")
+        if any(w in low for w in reasoning_words):
+            score += 0.2
+        if diagnosis:
+            stopwords = {"the", "a", "an", "is", "to", "of", "and", "in", "it", "this"}
+            diag_words = set(diagnosis.lower().split()) - stopwords
+            plan_words = set(plan.lower().split()) - stopwords
+            if len(diag_words & plan_words) >= 3:
+                score += 0.1
+        if len(plan) > 80:
+            score += 0.1
+        return round(score, 4)
+
+    def _compute_reward(self, new_acc: float, param_count: int, runtime_error: bool) -> float:
+        if runtime_error:
+            return -1.0
+        reward = 0.1
+        reward += 10.0 * (new_acc - self._last_accuracy)
+        reward -= 0.01 * (param_count / 1000)
+        return round(reward, 4)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _parse_results(
+        self, results_file: Path, proc
+    ) -> tuple[float, int, list, Optional[str], bool]:
+        accuracy, param_count, loss_curve = 0.0, 0, []
+        error_logs: Optional[str] = None
         runtime_error = False
 
         if results_file.exists():
@@ -158,53 +240,48 @@ class NeuralArchEnvironment(Environment):
                 loss_curve = data.get("loss_curve", [])
                 error_raw = data.get("error")
                 if error_raw:
-                    trainer_error = error_raw
+                    error_logs = error_raw
                     runtime_error = "RuntimeError" in error_raw
-                    error_logs = (
-                        (error_logs + "\n" + trainer_error) if error_logs else trainer_error
-                    )
             except (json.JSONDecodeError, ValueError):
-                trainer_error = "Failed to parse results.json"
+                error_logs = "Failed to parse results.json"
                 runtime_error = True
-                error_logs = (error_logs + "\n" + trainer_error) if error_logs else trainer_error
         else:
-            trainer_error = proc.stderr or "Trainer produced no output"
+            error_logs = proc.stderr or "Trainer produced no output"
             runtime_error = True
-            error_logs = (error_logs + "\n" + trainer_error) if error_logs else trainer_error
 
-        reward = self._compute_reward(accuracy, param_count, runtime_error)
-        self._last_accuracy = accuracy
+        return accuracy, param_count, loss_curve, error_logs, runtime_error
 
+    def _build_obs(
+        self,
+        reward: float = 0.0,
+        error_logs: Optional[str] = None,
+        accuracy: Optional[float] = None,
+        param_count: int = 0,
+        loss_curve: Optional[list] = None,
+        phase_rewards_override: Optional[list] = None,
+    ) -> NeuralArchObservation:
         return NeuralArchObservation(
             current_code=self._current_code,
             architecture_name=self._current_arch_name,
             dataset_name=self._current_dataset_name,
-            last_accuracy=accuracy,
+            last_accuracy=accuracy if accuracy is not None else self._last_accuracy,
             param_count=param_count,
-            loss_curve=loss_curve,
+            loss_curve=loss_curve or [],
             error_logs=error_logs,
             done=False,
             reward=reward,
+            current_phase=self._current_phase,
+            last_diagnosis=self._last_diagnosis,
+            last_plan=self._last_plan,
+            phase_rewards=phase_rewards_override if phase_rewards_override is not None else list(self._phase_rewards),
         )
 
-    @property
-    def state(self) -> State:
-        return self._state
-
-    def close(self) -> None:
-        self._cleanup()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _compute_reward(self, new_acc: float, param_count: int, runtime_error: bool) -> float:
-        if runtime_error:
-            return -1.0
-        reward = 0.1  # execution reward
-        reward += 10.0 * (new_acc - self._last_accuracy)  # performance delta
-        reward -= 0.01 * (param_count / 1000)              # efficiency penalty
-        return round(reward, 4)
+    def _reset_cycle(self) -> None:
+        """Advance back to diagnose phase for the next cycle."""
+        self._current_phase = "diagnose"
+        self._last_diagnosis = None
+        self._last_plan = None
+        self._phase_rewards = []
 
     def _cleanup(self) -> None:
         if self._workdir and self._workdir.exists():

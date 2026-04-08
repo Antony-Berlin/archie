@@ -1,45 +1,29 @@
 """
 Dataset Library for NeuralArch-Bench.
 
-DATASET_LIBRARY maps dataset names to config dicts used by trainer.py.
-Each config is plain JSON-serializable data — no callables.
+Tabular CSV datasets — no image processing, trains in seconds.
+Each entry has the csv_path, num_features, and num_classes needed by trainer.py.
 """
 
-import os
+from pathlib import Path
+
+_DATA_DIR = Path(__file__).parent.parent / "data"
 
 DATASET_LIBRARY: dict[str, dict] = {
-    "fashion_mnist": {
-        "torchvision_class": "FashionMNIST",
-        "data_dir": os.environ.get("FASHION_MNIST_DIR", "/tmp/fashion_mnist"),
-        "input_channels": 1,
-        "input_size": 28,
-        "num_classes": 10,
-        "normalize_mean": [0.5],
-        "normalize_std": [0.5],
-        "train_subset": 8000,
-        "test_subset": 2000,
+    "iris": {
+        "csv_path": str(_DATA_DIR / "iris.csv"),
+        "num_features": 4,
+        "num_classes": 3,
     },
-    "mnist": {
-        "torchvision_class": "MNIST",
-        "data_dir": os.environ.get("MNIST_DIR", "/tmp/mnist"),
-        "input_channels": 1,
-        "input_size": 28,
-        "num_classes": 10,
-        "normalize_mean": [0.5],
-        "normalize_std": [0.5],
-        "train_subset": 8000,
-        "test_subset": 2000,
+    "wine": {
+        "csv_path": str(_DATA_DIR / "wine.csv"),
+        "num_features": 13,
+        "num_classes": 3,
     },
-    "cifar10": {
-        "torchvision_class": "CIFAR10",
-        "data_dir": os.environ.get("CIFAR10_DIR", "/tmp/cifar10"),
-        "input_channels": 3,
-        "input_size": 32,
-        "num_classes": 10,
-        "normalize_mean": [0.4914, 0.4822, 0.4465],
-        "normalize_std": [0.2023, 0.1994, 0.2010],
-        "train_subset": 8000,
-        "test_subset": 2000,
+    "breast_cancer": {
+        "csv_path": str(_DATA_DIR / "breast_cancer.csv"),
+        "num_features": 30,
+        "num_classes": 2,
     },
 }
 

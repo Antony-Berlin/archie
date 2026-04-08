@@ -13,3 +13,5 @@ results.json
 /tmp/
 .claude/
 .env
+docs/
+ENV_DESIGN_DOCUMENT.md

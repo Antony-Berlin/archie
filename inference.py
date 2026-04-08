@@ -33,6 +33,7 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 from openai import OpenAI
+from openenv.auto.auto_env import AutoEnv
 
 try:
     from my_env_v4 import MyEnvV4Action, MyEnvV4Env  # type: ignore[import]
@@ -42,6 +43,7 @@ except ImportError:
     from core.models import NeuralArchAction as _Action  # type: ignore[assignment]
     from server.neural_arch_environment import NeuralArchEnvironment as _Env  # type: ignore[assignment]
 
+# IMAGE_NAME is set by the validator to the running Space/container base URL
 IMAGE_NAME = os.getenv("IMAGE_NAME")
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
@@ -251,7 +253,13 @@ async def main() -> None:
     client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
     if IMAGE_NAME:
-        env = await _Env.from_docker_image(IMAGE_NAME)
+        # Validator passes IMAGE_NAME as the base URL of the already-running Space.
+        # Connect via HTTP — no Docker spin-up needed.
+        env = AutoEnv.from_env(
+            "neural-arch-bench",
+            base_url=IMAGE_NAME,
+            skip_install=True,
+        )
     else:
         env = _Env()
 
